@@ -8,6 +8,9 @@ import logging
 import requests
 from hijri_converter import Gregorian
 from functools import lru_cache
+from astral import LocationInfo
+from astral.sun import sun
+from astral.moon import moon_phase, moonrise, moonset
 
 # Configuratie logging
 logging.basicConfig(
@@ -17,8 +20,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constanten
-API_KEY = 'YOUR_API_KEY'
-EARTH_RADIUS = 6378137  # in meters
+OPENWEATHER_API_KEY = 'YOUR_OPENWEATHER_API_KEY'
+GOOGLE_MAPS_API_KEY = 'YOUR_GOOGLE_MAPS_API_KEY'
 
 @dataclass(frozen=True)
 class Location:
@@ -29,9 +32,9 @@ class Location:
     name: str = "Onbekende Locatie"
 
     def __post_init__(self):
-        object.__setattr__(self, '_validate_latitude', self._validate_latitude())
-        object.__setattr__(self, '_validate_longitude', self._validate_longitude())
-        object.__setattr__(self, '_validate_elevation', self._validate_elevation())
+        self._validate_latitude()
+        self._validate_longitude()
+        self._validate_elevation()
 
     def _validate_latitude(self):
         if not -90 <= self.latitude <= 90:
@@ -90,6 +93,140 @@ class HanafiMethode(BerekeningsMethode):
 
     def get_isha_hoek(self) -> float:
         return 18.0
+
+class OpenWeatherMapProvider:
+    """Haalt weersinformatie op via de OpenWeatherMap API."""
+
+    def __init__(self, api_sleutel: str):
+        self.api_sleutel = api_sleutel
+        self.api_host = 'https://api.openweathermap.org/data/2.5/weather'
+        self.sessie = requests.Session()
+
+    def haal_weer_data(self, location: Location) -> Dict:
+        try:
+            params = {
+                'lat': location.latitude,
+                'lon': location.longitude,
+                'appid': self.api_sleutel,
+                'units': 'metric',
+                'lang': 'nl'
+            }
+            response = self.sessie.get(self.api_host, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            logger.error(f"Netwerkfout bij ophalen weersdata: {e}")
+            return {'error': f"Netwerkfout: {str(e)}"}
+        except Exception as e:
+            logger.error(f"Onverwachte fout bij ophalen weersdata: {e}")
+            return {'error': f"Onverwachte fout: {str(e)}"}
+
+class GebedsTijdenCalculator:
+    """Bereken gebedstijden en haal weers- en astronomische data op."""
+
+    METHODEN = {
+        'standaard': StandaardMethode(),
+        'hanafi': HanafiMethode(),
+    }
+
+    def __init__(self, location: Location, methode: str = 'standaard'):
+        self.location = location
+        methode_lower = methode.lower()
+        if methode_lower not in self.METHODEN:
+            raise ValueError(f"Niet-ondersteunde methode. Kies uit: {', '.join(self.METHODEN.keys())}")
+        self.methode = self.METHODEN[methode_lower]
+        self.weer_provider = OpenWeatherMapProvider(OPENWEATHER_API_KEY)
+
+    def bereken_gebedstijden(self, datum: Union[date, datetime],
+                             formaat: str = '24u') -> Dict[str, Union[str, Dict]]:
+        try:
+            if isinstance(datum, date) and not isinstance(datum, datetime):
+                datum = datetime.combine(datum, datetime.min.time())
+
+            # Zet datum naar UTC
+            datum_utc = datum.replace(tzinfo=ZoneInfo('UTC'))
+
+            # Bereken gebedstijden
+            calculator = AstronomischeBerekeningen(self.location, datum_utc)
+            tijden = calculator.calculate_prayer_times(self.methode)
+
+            # Formatteer tijden
+            geformatteerde_tijden = {
+                gebed: self._formatteer_tijd(tijd, formaat)
+                for gebed, tijd in tijden.items()
+            }
+
+            # Haal weersdata op
+            weer_data = self.weer_provider.haal_weer_data(self.location)
+
+            # Haal zon- en maanstanden op met Astral
+            astral_loc = LocationInfo(name=self.location.name, region="", timezone=self.location.timezone_str,
+                                      latitude=self.location.latitude, longitude=self.location.longitude)
+            s = sun(astral_loc.observer, date=datum_utc, tzinfo=ZoneInfo('UTC'))
+            maan_fase = moon_phase(datum_utc)
+            maan_opkomst = moonrise(astral_loc.observer, date=datum_utc, tzinfo=ZoneInfo('UTC'))
+            maan_ondergang = moonset(astral_loc.observer, date=datum_utc, tzinfo=ZoneInfo('UTC'))
+
+            maan_data = {
+                'maan_fase': maan_fase,
+                'maanopkomst': maan_opkomst.strftime("%H:%M") if maan_opkomst else 'N/B',
+                'maanondergang': maan_ondergang.strftime("%H:%M") if maan_ondergang else 'N/B'
+            }
+
+            # Controleer condities
+            notificaties = []
+            if 'error' not in weer_data:
+                temperatuur = weer_data.get('main', {}).get('temp')
+                weersomstandigheden = weer_data.get('weather', [{}])[0].get('description', '').lower()
+                if temperatuur and temperatuur < 5 and maan_opkomst:
+                    notificaties.append("Temperatuur laag en de maan komt op.")
+            else:
+                logger.warning(f"Geen weersdata beschikbaar: {weer_data.get('error')}")
+
+            notificatie = "; ".join(notificaties) if notificaties else "Geen meldingen."
+
+            return {
+                **geformatteerde_tijden,
+                'weer': weer_data,
+                'maan': maan_data,
+                'gregoriaanse_datum': datum_utc.strftime("%Y-%m-%d"),
+                'hijri_datum': self._krijg_hijri_datum(datum_utc),
+                'notificatie': notificatie
+            }
+
+        except Exception as e:
+            logger.error(f"Fout bij berekenen gebedstijden: {e}")
+            raise
+
+    @staticmethod
+    def _formatteer_tijd(tijd: float, formaat: str = '24u') -> str:
+        """Formatteer tijd naar gewenst formaat."""
+        if math.isnan(tijd):
+            return 'Ongeldig'
+
+        uren = int(tijd)
+        minuten = int(round((tijd - uren) * 60))
+
+        if minuten == 60:
+            uren = (uren + 1) % 24
+            minuten = 0
+
+        if formaat == '12u':
+            periode = 'AM' if uren < 12 else 'PM'
+            weergave_uren = uren % 12 or 12
+            return f"{weergave_uren:02d}:{minuten:02d} {periode}"
+        return f"{uren:02d}:{minuten:02d}"
+
+    @staticmethod
+    def _krijg_hijri_datum(datum: datetime) -> str:
+        """Converteer Gregoriaanse datum naar Hijri datum."""
+        try:
+            gregoriaans = Gregorian(datum.year, datum.month, datum.day)
+            hijri = gregoriaans.to_hijri()
+            return f"{hijri.day} {hijri.month_name()} {hijri.year} AH"
+        except Exception as e:
+            logger.error(f"Fout bij conversie naar Hijri datum: {e}")
+            return "Ongeldige Hijri datum"
 
 class AstronomischeBerekeningen:
     """Beheert nauwkeurige astronomische berekeningen voor zonpositie en tijden."""
@@ -234,79 +371,14 @@ class AstronomischeBerekeningen:
         return tijden
 
     def _get_zon_correctie(self) -> float:
-        """Bereken correctie voor zonhoogte op basis van atmosferische refractie en hoogte."""
+        """Corrigeer de zonhoogte op basis van atmosferische refractie en hoogte."""
         refractie = 0.0347  # Refractie bij de horizon in graden
         hoogte = self.location.elevation
         horizon_daling = math.degrees(math.acos(EARTH_RADIUS / (EARTH_RADIUS + hoogte))) if hoogte > 0 else 0
         return refractie + horizon_daling
 
-class MaanDataProvider:
-    """Haalt maandata op via de QWeather API."""
-
-    def __init__(self, api_sleutel: str):
-        self.api_sleutel = api_sleutel
-        self.api_host = 'https://devapi.qweather.com/v7/astronomy/moon'
-        self.sessie = requests.Session()
-
-    def haal_maan_data(self, location: Location, datum: datetime) -> Dict:
-        """
-        Haalt maandata op voor een specifieke locatie en datum.
-
-        Args:
-            location: De locatie waarvoor maandata wordt opgevraagd
-            datum: De datum waarvoor maandata wordt opgevraagd
-
-        Returns:
-            Een dictionary met maandata of foutinformatie
-        """
-        try:
-            datum_str = datum.strftime("%Y%m%d")
-            params = {
-                'key': self.api_sleutel,
-                'location': f"{location.longitude},{location.latitude}",
-                'date': datum_str
-                # 'lang': 'nl'  # Optioneel: stel taal in
-            }
-
-            response = self.sessie.get(self.api_host, params=params, timeout=10)
-            response.raise_for_status()
-
-            data = response.json()
-            if data.get('code') != '200':
-                bericht = data.get('message', 'Onbekende fout')
-                raise ValueError(f"API Response Fout {data.get('code')}: {bericht}")
-
-            return self._verwerk_maan_data(data)
-
-        except requests.RequestException as e:
-            logger.error(f"Netwerkfout bij ophalen maandata: {e}")
-            return {'error': f"Netwerkfout: {str(e)}"}
-        except ValueError as e:
-            logger.error(f"API fout bij ophalen maandata: {e}")
-            return {'error': str(e)}
-        except Exception as e:
-            logger.error(f"Onverwachte fout bij ophalen maandata: {e}")
-            return {'error': f"Onverwachte fout: {str(e)}"}
-
-    def _verwerk_maan_data(self, data: Dict) -> Dict:
-        """Verwerk de ruwe API-response naar een gestructureerd formaat."""
-        return {
-            'maanopkomst': data.get('moonrise', 'N/B'),
-            'maanondergang': data.get('moonset', 'N/B'),
-            'maanfasen': [
-                {
-                    'tijd': fase.get('fxTime', 'N/B'),
-                    'waarde': fase.get('value', 'N/B'),
-                    'naam': fase.get('name', 'N/B'),
-                    'verlichting': fase.get('illumination', 'N/B'),
-                    'icoon': fase.get('icon', 'N/B')
-                }
-                for fase in data.get('moonPhase', [])
-            ]
-        }
-
 class GebedsTijdenCalculator:
-    """Bereken gebedstijden en haal maandata op."""
+    """Bereken gebedstijden en haal weers- en astronomische data op."""
 
     METHODEN = {
         'standaard': StandaardMethode(),
@@ -319,20 +391,10 @@ class GebedsTijdenCalculator:
         if methode_lower not in self.METHODEN:
             raise ValueError(f"Niet-ondersteunde methode. Kies uit: {', '.join(self.METHODEN.keys())}")
         self.methode = self.METHODEN[methode_lower]
-        self.maan_provider = MaanDataProvider(API_KEY)
+        self.weer_provider = OpenWeatherMapProvider(OPENWEATHER_API_KEY)
 
     def bereken_gebedstijden(self, datum: Union[date, datetime],
                              formaat: str = '24u') -> Dict[str, Union[str, Dict]]:
-        """
-        Bereken gebedstijden en haal maandata op voor een specifieke datum.
-
-        Args:
-            datum: De datum waarvoor gebedstijden worden berekend
-            formaat: Tijdsformaat ('24u' of '12u')
-
-        Returns:
-            Een dictionary met gebedstijden, maandata en datuminformatie
-        """
         try:
             if isinstance(datum, date) and not isinstance(datum, datetime):
                 datum = datetime.combine(datum, datetime.min.time())
@@ -350,14 +412,42 @@ class GebedsTijdenCalculator:
                 for gebed, tijd in tijden.items()
             }
 
-            # Haal maan data op
-            maan_data = self.maan_provider.haal_maan_data(self.location, datum_utc)
+            # Haal weersdata op
+            weer_data = self.weer_provider.haal_weer_data(self.location)
+
+            # Haal zon- en maanstanden op met Astral
+            astral_loc = LocationInfo(name=self.location.name, region="", timezone=self.location.timezone_str,
+                                      latitude=self.location.latitude, longitude=self.location.longitude)
+            s = sun(astral_loc.observer, date=datum_utc, tzinfo=ZoneInfo('UTC'))
+            maan_fase = moon_phase(datum_utc)
+            maan_opkomst = moonrise(astral_loc.observer, date=datum_utc, tzinfo=ZoneInfo('UTC'))
+            maan_ondergang = moonset(astral_loc.observer, date=datum_utc, tzinfo=ZoneInfo('UTC'))
+
+            maan_data = {
+                'maan_fase': maan_fase,
+                'maanopkomst': maan_opkomst.strftime("%H:%M") if maan_opkomst else 'N/B',
+                'maanondergang': maan_ondergang.strftime("%H:%M") if maan_ondergang else 'N/B'
+            }
+
+            # Controleer condities
+            notificaties = []
+            if 'error' not in weer_data:
+                temperatuur = weer_data.get('main', {}).get('temp')
+                weersomstandigheden = weer_data.get('weather', [{}])[0].get('description', '').lower()
+                if temperatuur and temperatuur < 5 and maan_opkomst:
+                    notificaties.append("Temperatuur laag en de maan komt op.")
+            else:
+                logger.warning(f"Geen weersdata beschikbaar: {weer_data.get('error')}")
+
+            notificatie = "; ".join(notificaties) if notificaties else "Geen meldingen."
 
             return {
                 **geformatteerde_tijden,
+                'weer': weer_data,
                 'maan': maan_data,
                 'gregoriaanse_datum': datum_utc.strftime("%Y-%m-%d"),
-                'hijri_datum': self._krijg_hijri_datum(datum_utc)
+                'hijri_datum': self._krijg_hijri_datum(datum_utc),
+                'notificatie': notificatie
             }
 
         except Exception as e:
@@ -434,8 +524,19 @@ def main():
                     print("-" * 30)
 
                     for gebed, tijd in tijden.items():
-                        if gebed not in ['gregoriaanse_datum', 'hijri_datum', 'maan']:
+                        if gebed not in ['gregoriaanse_datum', 'hijri_datum', 'maan', 'weer', 'notificatie']:
                             print(f"{gebed.capitalize():10}: {tijd}")
+
+                    # Print weer data
+                    weer = tijden.get('weer', {})
+                    if 'error' in weer:
+                        print(f"\nWeer Data Fout: {weer['error']}")
+                    else:
+                        temperatuur = weer.get('main', {}).get('temp', 'N/B')
+                        weersomstandigheden = weer.get('weather', [{}])[0].get('description', 'N/B')
+                        print(f"\nWeer Data:")
+                        print(f"  Temperatuur     : {temperatuur}°C")
+                        print(f"  Weersomstandigheden: {weersomstandigheden}")
 
                     # Print maan data
                     maan = tijden.get('maan', {})
@@ -443,16 +544,18 @@ def main():
                         print(f"\nMaan Data Fout: {maan['error']}")
                     else:
                         print("\nMaan Data:")
-                        print(f"  Maanopkomst    : {maan.get('maanopkomst', 'N/B')}")
-                        print(f"  Maanondergang  : {maan.get('maanondergang', 'N/B')}")
+                        print(f"  Maanfase        : {maan.get('maan_fase', 'N/B')}")
+                        print(f"  Maanopkomst     : {maan.get('maanopkomst', 'N/B')}")
+                        print(f"  Maanondergang   : {maan.get('maanondergang', 'N/B')}")
                         print("  Maanfasen:")
-                        for fase in maan.get('maanfasen', []):
-                            print(f"    Tijd         : {fase.get('tijd', 'N/B')}")
-                            print(f"    Waarde       : {fase.get('waarde', 'N/B')}")
-                            print(f"    Naam         : {fase.get('naam', 'N/B')}")
-                            print(f"    Verlichting  : {fase.get('verlichting', 'N/B')}%")
-                            print(f"    Icoon        : {fase.get('icoon', 'N/B')}")
-                            print("    ---")
+                        print(f"    Maanfase     : {maan.get('maan_fase', 'N/B')}")
+                        print(f"    Maanopkomst  : {maan.get('maanopkomst', 'N/B')}")
+                        print(f"    Maanondergang: {maan.get('maanondergang', 'N/B')}")
+                        print("    ---")
+
+                    # Print notificatie
+                    notificatie = tijden.get('notificatie', '')
+                    print(f"\nNotificatie     : {notificatie}")
 
                 except Exception as e:
                     logger.error(f"Fout voor {locatie.name}, methode {methode}: {e}")
