@@ -1,4 +1,3 @@
-```python
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, Union, List, Optional
@@ -484,4 +483,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
